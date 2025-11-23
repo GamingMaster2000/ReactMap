@@ -631,7 +631,11 @@
       "maxConnections": 10,
       "userBackupLimits": 10,
       "userBackupSizeLimit": 10000000,
-      "extraUserFields": []
+      "extraUserFields": [],
+      "timeout": 5000,
+      "errorThreshold": 50,
+      "resetTimeout": 30000,
+      "rollingCountTimeout": 10000
     },
     "schemas": []
   },

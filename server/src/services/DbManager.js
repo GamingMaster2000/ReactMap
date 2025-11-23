@@ -3,6 +3,7 @@
 /* eslint-disable no-await-in-loop */
 const { knex } = require('knex')
 const { raw } = require('objection')
+const CircuitBreaker = require('opossum')
 const config = require('@rm/config')
 const { Logger, TAGS } = require('@rm/logger')
 
@@ -49,6 +50,7 @@ class DbManager extends Logger {
       Pokestop: { hasConfirmedInvasions: false },
     })
     this.reactMapDb = null
+    this.circuitBreakers = []
     this.connections = config
       .getSafe('database.schemas')
       .filter((s) => s.useFor.length)
@@ -74,7 +76,7 @@ class DbManager extends Logger {
           return null
         }
         const { log } = new Logger('knex', schema.database)
-        return knex({
+        const knexInstance = knex({
           client: 'mysql2',
           connection: {
             host: schema.host,
@@ -100,6 +102,9 @@ class DbManager extends Logger {
             enableColors: true,
           },
         })
+        const breaker = this.createCircuitBreaker(knexInstance, schema, i)
+        this.circuitBreakers[i] = breaker
+        return knexInstance
       })
     if (this.reactMapDb === null) {
       this.log.error('No database connection was found for the User model')
@@ -107,6 +112,71 @@ class DbManager extends Logger {
     }
   }
 
+  /**
+   * @param {import('knex').Knex} knexInstance 
+   * @param {object} schema 
+   * @param {number} index 
+   */
+  createCircuitBreaker(knexInstance, schema, index) {
+    const dbName = `${schema.database}@${schema.host}`
+    // Wrap the query execution in a circuit breaker
+    const breaker = new CircuitBreaker(
+      async (queryFn) => {
+        return await queryFn()
+      },
+      {
+        timeout: config.getSafe('database.settings.timeout') || 5000, // 5 seconds default
+        errorThresholdPercentage: config.getSafe('database.settings.errorThreshold') || 50,
+        resetTimeout: config.getSafe('database.settings.resetTimeout') || 30000, // 30 seconds
+        rollingCountTimeout: config.getSafe('database.settings.rollingCountTimeout') || 10000,
+        rollingCountBuckets: 10,
+        name: dbName,
+      }
+    )
+    // Set up event listeners
+    breaker.on('open', () => {
+      this.log.error(`Circuit OPENED for database: ${dbName} (index ${index})`)
+      this.log.error(`Database ${dbName} is temporarily disabled due to repeated failures`)
+    })
+    breaker.on('halfOpen', () => {
+      this.log.warn(`Circuit HALF-OPEN for database: ${dbName} (index ${index})`)
+      this.log.warn(`Testing if ${dbName} has recovered...`)
+    })
+    breaker.on('close', () => {
+      this.log.info(`Circuit CLOSED for database: ${dbName} (index ${index})`)
+      this.log.info(`Database ${dbName} has recovered and is back online`)
+    })
+    breaker.on('fallback', () => {
+      this.log.warn(`Fallback triggered for database: ${dbName} (index ${index})`)
+    })
+    breaker.on('timeout', () => {
+      this.log.warn(`Query timeout on database: ${dbName} (index ${index})`)
+    })
+    return breaker
+  }
+  
+  /**
+   * @param {number} connectionIndex 
+   * @param {Function} queryFn 
+   */
+  async executeWithCircuitBreaker(connectionIndex, queryFn) {
+    const breaker = this.circuitBreakers[connectionIndex]
+    if (!breaker) {
+      // No circuit breaker for this connection (e.g., endpoints)
+      return await queryFn()
+    }
+    if (breaker.opened) {
+      this.log.debug(`Circuit is OPEN for connection ${connectionIndex} - skipping query`)
+      return null  // Let the calling method handle this
+    }
+    try {
+      return await breaker.fire(queryFn)
+    } catch (error) {
+      this.log.warn(`Query failed on connection ${connectionIndex}:`, error.message)
+      return null
+    }
+  }
+  
   /**
    * @param {{ lat: number, lon: number }} args
    * @param {boolean} isMad
@@ -232,18 +302,20 @@ class DbManager extends Logger {
         this.connections.length > 1 ? 's' : ''
       }`,
     )
-    await Promise.all(
+    await Promise.allSettled(
       this.connections.map(async (schema, i) => {
         try {
-          const schemaContext = schema
-            ? await DbManager.schemaCheck(schema)
+          const schemaContext = await this.executeWithCircuitBreaker(i, async () => {
+            return (schema) ?
+              await DbManager.schemaCheck(schema)
             : {
                 mem: this.endpoints[i].endpoint,
                 secret: this.endpoints[i].secret,
                 httpAuth: this.endpoints[i].httpAuth,
                 pvpV2: true,
               }
-
+          })
+          
           Object.entries(this.models).forEach(([category, sources]) => {
             if (Array.isArray(sources)) {
               sources.forEach((source, j) => {
@@ -302,18 +374,23 @@ class DbManager extends Logger {
   async historicalRarity() {
     this.log.info('Setting historical rarity stats')
     try {
-      const results = await Promise.all(
+      const results = await Promise.allSettled(
         (this.models.Pokemon ?? []).map(async (source) =>
-          source.isMad || source.mem
+          this.executeWithCircuitBreaker(source.conncetion, async () => {
+            return source.isMad || source.mem
             ? []
             : source.SubModel.query()
                 .select('pokemon_id', raw('SUM(count) as total'))
                 .from('pokemon_stats')
-                .groupBy('pokemon_id'),
+                .groupBy('pokemon_id')
+          })
         ),
       )
+      const successfulResults = results
+        .filter(result => result.status === 'fulfilled' && result.value)
+        .map(result => result.value)
       this.setRarity(
-        results.map((result) =>
+        successfulResults.map((result) =>
           Object.fromEntries(
             result.map((pkmn) => [`${pkmn.pokemon_id}`, +pkmn.total]),
           ),
@@ -413,14 +490,22 @@ class DbManager extends Logger {
    */
   async getAll(model, perms, args, userId, method = 'getAll') {
     try {
-      const data = await Promise.all(
-        this.models[model].map(async ({ SubModel, ...source }) =>
-          SubModel[method](perms, args, source, userId),
-        ),
+      const data = await Promise.allSettled(
+        this.models[model].map(async ({ SubModel, connection, ...source }) => {
+          return this.executeWithCircuitBreaker(connection, async () => {
+            return SubModel[method](perms, args, source, userId)
+          })
+        }),
       )
-      return DbManager.deDupeResults(data)
+      const successfulResults = data
+        .filter(result => result.status === 'fulfilled' && result.value)
+        .map(result => result.value)
+      if (successfulResults.length === 0)
+        this.log.warn(TAGS[model.toLowerCase()] ?? model, 'All database connections failed or are open')
+      
+      return DbManager.deDupeResults(successfulResults)
     } catch (e) {
-      this.log.error(TAGS[model.toLowerCase()], e)
+      this.log.error(TAGS[model.toLowerCase()] ?? model, e)
       throw e
     }
   }
@@ -432,12 +517,17 @@ class DbManager extends Logger {
    * @returns {Promise<T | {}>}
    */
   async getOne(model, id) {
-    const data = await Promise.all(
-      this.models[model].map(async ({ SubModel, ...source }) =>
-        SubModel.getOne(id, source),
-      ),
+    const data = await Promise.allSettled(
+      this.models[model].map(async ({ SubModel, connection, ...source }) => {
+        return this.executeWithCircuitBreaker(connection, async () => {
+          return SubModel.getOne(id, source)
+        })
+      }),
     )
-    const cleaned = DbManager.deDupeResults(data.filter(Boolean))
+    const successfulResults = data
+      .filter(result => result.status === 'fulfilled' && result.value)
+      .map(result => result.value)
+    const cleaned = DbManager.deDupeResults(successfulResults)
     return cleaned || {}
   }
 
@@ -481,18 +571,23 @@ class DbManager extends Logger {
       const loopTime = Date.now()
       count += 1
       const bbox = getBboxFromCenter(args.lat, args.lon, distance)
-      const data = await Promise.all(
-        this.models[model].map(async ({ SubModel, ...source }) =>
-          SubModel[method](
-            perms,
-            args,
-            source,
-            DbManager.getDistance(args, source.isMad),
-            bbox,
-          ),
+      const data = await Promise.allSettled(
+        this.models[model].map(async ({ SubModel, connection, ...source }) =>
+          this.executeWithCircuitBreaker(connection, async () => {
+            return SubModel[method](
+              perms,
+              args,
+              source,
+              DbManager.getDistance(args, source.isMad),
+              bbox,
+            )
+          })
         ),
       )
-      const results = DbManager.deDupeResults(data)
+      const successfulResults = data
+        .filter(result => result.status === 'fulfilled' && result.value)
+        .map(result => result.value)
+      const results = DbManager.deDupeResults(successfulResults)
       if (results.length > deDuped.length) {
         deDuped = results
       }
@@ -550,17 +645,27 @@ class DbManager extends Logger {
    * ]>}
    */
   async submissionCells(perms, args) {
-    const stopData = await Promise.all(
-      this.models.Pokestop.map(async ({ SubModel, ...source }) =>
-        SubModel.getSubmissions(perms, args, source),
+    const stopData = await Promise.allSettled(
+      this.models.Pokestop.map(async ({ SubModel, connection, ...source }) =>
+        this.executeWithCircuitBreaker(connection, async () => {
+          return SubModel.getSubmissions(perms, args, source)
+        })
       ),
     )
-    const gymData = await Promise.all(
-      this.models.Gym.map(async ({ SubModel, ...source }) =>
-        SubModel.getSubmissions(perms, args, source),
+    const gymData = await Promise.allSettled(
+      this.models.Gym.map(async ({ SubModel, connection, ...source }) =>
+        this.executeWithCircuitBreaker(connection, async () => {
+          return SubModel.getSubmissions(perms, args, source)
+        })
       ),
     )
-    return [DbManager.deDupeResults(stopData), DbManager.deDupeResults(gymData)]
+    const successfulStops = stopData
+      .filter(result => result.status === 'fulfilled' && result.value)
+      .map(result => result.value)
+    const successfulGyms = gymData
+      .filter(result => result.status === 'fulfilled' && result.value)
+      .map(result => result.value)
+    return [DbManager.deDupeResults(successfulStops), DbManager.deDupeResults(successfulGyms)]
   }
 
   /**
@@ -583,12 +688,17 @@ class DbManager extends Logger {
    */
   async query(model, method, ...args) {
     if (Array.isArray(this.models[model])) {
-      const data = await Promise.all(
-        this.models[model].map(async ({ SubModel, ...source }) =>
-          SubModel[method](...args, source),
+      const data = await Promise.allSettled(
+        this.models[model].map(async ({ SubModel, connection, ...source }) =>
+          this.executeWithCircuitBreaker(connection, async () => {
+            return SubModel[method](...args, source)
+          })
         ),
       )
-      return DbManager.deDupeResults(data.filter(Boolean))
+      const successfulResults = data
+        .filter(result => result.status === 'fulfilled' && result.value)
+        .map(result => result.value)
+      return DbManager.deDupeResults(successfulResults)
     }
     return this.models[model][method](...args)
   }
@@ -602,15 +712,20 @@ class DbManager extends Logger {
     if (this.models[model]) {
       this.log.info(`Querying available for ${model}`)
       try {
-        const results = await Promise.all(
-          this.models[model].map(async ({ SubModel, ...source }) =>
-            SubModel.getAvailable(source),
+        const results = await Promise.allSettled(
+          this.models[model].map(async ({ SubModel, connection, ...source }) =>
+            this.executeWithCircuitBreaker(connection, async () => {
+              return SubModel.getAvailable(source)
+            })
           ),
         )
+        const successfulResults = results
+          .filter(result => result.status === 'fulfilled' && result.value)
+          .map(result => result.value)
         this.log.info(`Setting available for ${model}`)
         if (model === 'Pokestop') {
           const newQuestConditions = {}
-          results.forEach((result) => {
+          successfulResults.forEach((result) => {
             if ('conditions' in result) {
               config.util.extendDeep(newQuestConditions, result.conditions)
             }
@@ -623,14 +738,14 @@ class DbManager extends Logger {
           )
         }
         if (model === 'Pokemon') {
-          this.setRarity(results, false)
+          this.setRarity(successfulResults, false)
         }
-        if (results.length === 1) return results[0].available
-        if (results.length > 1) {
+        if (successfulResults.length === 1) return successfulResults[0].available
+        if (successfulResults.length > 1) {
           const returnSet = new Set()
-          for (let i = 0; i < results.length; i += 1) {
-            for (let j = 0; j < results[i].available.length; j += 1) {
-              returnSet.add(results[i].available[j])
+          for (let i = 0; i < successfulResults.length; i += 1) {
+            for (let j = 0; j < successfulResults[i].available.length; j += 1) {
+              returnSet.add(successfulResults[i].available[j])
             }
           }
           return [...returnSet]
@@ -654,29 +769,41 @@ class DbManager extends Logger {
   async getFilterContext() {
     if (this.models.Route) {
       try {
-        const results = await Promise.all(
-          this.models.Route.map(({ SubModel, ...source }) =>
-            SubModel.getFilterContext(source),
+        const results = await Promise.allSettled(
+          this.models.Route.map(({ SubModel, connection, ...source }) =>
+            this.executeWithCircuitBreaker(connection, async () => {
+              return SubModel.getFilterContext(source)
+            })
           ),
         )
-        this.filterContext.Route.maxDistance = Math.max(
-          ...results.map((result) => result.max_distance),
-        )
-        this.filterContext.Route.maxDuration = Math.max(
-          ...results.map((result) => result.max_duration),
-        )
-        this.log.info('Updating filter context for routes')
+        const successfulResults = results
+          .filter(result => result.status === 'fulfilled' && result.value)
+          .map(result => result.value)
+        if (successfulResults.length > 0) {
+          this.filterContext.Route.maxDistance = Math.max(
+            ...results.map((result) => result.max_distance),
+          )
+          this.filterContext.Route.maxDuration = Math.max(
+            ...results.map((result) => result.max_duration),
+          )
+          this.log.info('Updating filter context for routes')
+        }
       } catch (e) {
         this.log.error(e)
       }
     }
     if (this.models.Pokestop) {
-      const results = await Promise.all(
-        this.models.Pokestop.map(({ SubModel, ...source }) =>
-          SubModel.getFilterContext(source),
+      const results = await Promise.allSettled(
+        this.models.Pokestop.map(({ SubModel, connection, ...source }) =>
+          this.executeWithCircuitBreaker(connection, async () => {
+            return SubModel.getFilterContext(source)
+          })
         ),
       )
-      this.filterContext.Pokestop.hasConfirmedInvasions = results.some(
+      const successfulResults = results
+        .filter(result => result.status === 'fulfilled' && result.value)
+        .map(result => result.value)
+      this.filterContext.Pokestop.hasConfirmedInvasions = successfulResults.some(
         (result) => result.hasConfirmedInvasions,
       )
     }
